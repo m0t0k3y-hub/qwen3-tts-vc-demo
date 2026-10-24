@@ -1,0 +1,9 @@
+[project]
+name = "qwen3-tts-vc"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "qwen-tts>=0.1.1",
+    "torch>=2.14.1",
+    "torchaudio>=2.11.0",
+]

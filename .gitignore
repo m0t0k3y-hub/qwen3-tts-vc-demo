@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+outputs/
+*.wav
+samples/
+wheels/
+*:Zone.Identifier
