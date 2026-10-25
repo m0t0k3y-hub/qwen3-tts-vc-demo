@@ -30,3 +30,11 @@ class Settings:
     @property
     def refs_dir(self) -> Path:
         return self.data_dir / "refs"
+
+    @property
+    def prompts_dir(self) -> Path:
+        return self.data_dir / "prompts"
+
+    @property
+    def samples_dir(self) -> Path:
+        return self.data_dir / "samples"

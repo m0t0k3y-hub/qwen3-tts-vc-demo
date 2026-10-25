@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pyloudnorm as pyln
 import pytest
@@ -154,3 +156,78 @@ def test_validate_accepts_and_warns(engine):
 def test_estimate_seconds(engine):
     assert engine.estimate_seconds("あ" * 70) == pytest.approx(10 * 1.5)
     assert engine.estimate_seconds("a" * 140) == pytest.approx(10 * 1.5)
+
+
+# ---- speaker library ------------------------------------------------------------------------
+
+@pytest.fixture
+def speakers(tmp_path):
+    from playground.speakers import SpeakerStore
+    return SpeakerStore(tmp_path / "db.sqlite3", tmp_path / "refs")
+
+
+def _ref(tmp_path, name="ref.wav", content=b"audio"):
+    p = tmp_path / name
+    p.write_bytes(content)
+    return p
+
+
+def test_speakers_add_list_find(speakers, tmp_path):
+    a = speakers.add("Alice", "clone", _ref(tmp_path), " こんにちは ", False, memo="memo")
+    assert a["ref_text"] == "こんにちは" and a["ref_audio"].startswith(str(tmp_path / "refs"))
+    b = speakers.add("Bob", "voice_design", _ref(tmp_path, "b.wav", b"b"), None, True, design={"instruct": "x"})
+    assert b["ref_text"] is None and b["design"] == {"instruct": "x"}
+    assert [s["name"] for s in speakers.list()] == ["Alice", "Bob"]
+    assert speakers.find_by_ref(a["ref_audio"], "こんにちは", False)["id"] == a["id"]
+    assert speakers.find_by_ref(a["ref_audio"], "別の文", False) is None
+    assert speakers.find_by_ref(b["ref_audio"], None, True)["id"] == b["id"]
+
+
+def test_speakers_validation(speakers, tmp_path):
+    speakers.add("Alice", "clone", _ref(tmp_path), "text", False)
+    with pytest.raises(ValueError, match="既に"):
+        speakers.add(" Alice ", "clone", _ref(tmp_path), "text", False)
+    with pytest.raises(ValueError, match="名前"):
+        speakers.add(" ", "clone", _ref(tmp_path), "text", False)
+    with pytest.raises(ValueError, match="x-vector"):
+        speakers.add("Carol", "clone", _ref(tmp_path), "", False)
+
+
+def test_speakers_update_delete(speakers, tmp_path):
+    a = speakers.add("Alice", "clone", _ref(tmp_path), "text", False)
+    speakers.add("Bob", "clone", _ref(tmp_path, "b.wav", b"b"), "text", False)
+    with pytest.raises(ValueError, match="既に"):
+        speakers.update(a["id"], "Bob", "")
+    assert speakers.update(a["id"], "Alicia", "new")["memo"] == "new"
+    assert speakers.delete(a["id"]) and speakers.get(a["id"]) is None
+    assert Path(a["ref_audio"]).exists()  # reference audio stays for history
+
+
+def test_save_voice_from_history(tmp_path):
+    from playground.speakers import SpeakerStore
+    settings = Settings(data_dir=tmp_path, metrics_path=tmp_path / "metrics.jsonl")
+    history = HistoryStore(settings.db_path)
+    engine = Engine(settings, ModelManager(18, loader=None), history,
+                    SpeakerStore(settings.db_path, settings.refs_dir))
+    out = _ref(tmp_path, "design.wav", b"designed")
+    history.add({**_record(1, kind="voice_design", instruct="低い声", seed=5, audio_path=str(out),
+                           x_vector_only=None), "params": {"gen": {"temperature": 0.9}}})
+    spk = engine.save_voice("r1", "Narrator")
+    assert spk["source"] == "voice_design" and spk["ref_text"] == "テキスト1"
+    assert spk["design"]["instruct"] == "低い声" and spk["design"]["seed"] == 5
+    ref = _ref(tmp_path, "mine.wav", b"mine")
+    history.add(_record(2, ref_audio=str(ref), ref_text="参照", x_vector_only=False))
+    assert engine.save_voice("r2", "Me")["source"] == "clone"
+    history.add(_record(3, kind="custom_voice"))
+    with pytest.raises(ValueError, match="CustomVoice"):
+        engine.save_voice("r3", "X")
+    with pytest.raises(ValueError, match="見つかりません"):
+        engine.save_voice("nope", "X")
+
+
+def test_prompt_path_depends_on_size_and_reference(engine):
+    a = GenRequest(kind="base", text="a", ref_audio="/x/abc.wav", ref_text="t")
+    b = GenRequest(kind="base", text="b", ref_audio="/y/abc.wav", ref_text="t")  # same content-addressed file
+    assert engine._prompt_path(a) == engine._prompt_path(b)
+    assert engine._prompt_path(a) != engine._prompt_path(GenRequest(**{**a.__dict__, "size": "0.6B"}))
+    assert engine._prompt_path(a) != engine._prompt_path(GenRequest(**{**a.__dict__, "ref_text": "u"}))
