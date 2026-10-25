@@ -12,15 +12,19 @@ from pathlib import Path
 
 import gradio as gr
 
+from playground import i18n
+from playground.asr import ASR_KEY, PLAYGROUND_MODEL_IDS, load_asr
 from playground.config import Settings
 from playground.engine import Engine
 from playground.history import HistoryStore
+from playground import messages as M
+from playground.i18n import say, t
 from playground.model_manager import ModelManager
 from playground.speakers import SpeakerStore
 from playground.ui_common import voice_choices
 from playground.ui_compare import compare_tab
 from playground.ui_generate import CloneTab, CustomTab, DesignTab, clone_tab, custom_tab, design_tab
-from playground.ui_history import history_tab
+from playground.ui_history import history_tab, record_summary
 from playground.ui_library import library_tab
 from playground.ui_system import system_tab
 
@@ -30,22 +34,25 @@ TAB_OF_KIND = {"base": "clone", "voice_design": "design", "custom_voice": "custo
 def build_app(engine: Engine) -> gr.Blocks:
     settings = engine.settings
     with gr.Blocks(title="Qwen3-TTS Playground") as demo:
-        gr.Markdown("# Qwen3-TTS Playground\n"
-                    "生成は GPU 1 枚で 1 件ずつ順に処理します。音声の長さの約 1.5 倍の時間がかかります。")
+        gr.Markdown("# Qwen3-TTS Playground")
+        gr.Markdown(t("生成は GPU 1 枚で 1 件ずつ順に処理します。音声の長さの約 1.5 倍の時間がかかります。"
+                      "表示言語は画面下の「設定」で切り替えられます。",
+                      "Generations run one at a time on a single GPU and take about 1.5x the audio length. "
+                      "Change the display language from Settings at the bottom of the page."))
         with gr.Tabs() as tabs:
-            with gr.Tab("ボイスクローン", id="clone") as clone_t:
+            with gr.Tab(t("ボイスクローン", "Voice clone"), id="clone") as clone_t:
                 clone = clone_tab(engine)
             with gr.Tab("VoiceDesign", id="design"):
                 design = design_tab(engine)
             with gr.Tab("CustomVoice", id="custom") as custom_t:
                 custom = custom_tab(engine)
-            with gr.Tab("話者ライブラリ", id="library") as library_t:
+            with gr.Tab(t("話者ライブラリ", "Speaker library"), id="library") as library_t:
                 library = library_tab(engine)
-            with gr.Tab("比較", id="compare") as compare_t:
+            with gr.Tab(t("比較", "Compare"), id="compare") as compare_t:
                 compare = compare_tab(engine)
-            with gr.Tab("履歴", id="history") as history_t:
+            with gr.Tab(t("履歴", "History"), id="history") as history_t:
                 history = history_tab(engine)
-            with gr.Tab("システム", id="system") as system_t:
+            with gr.Tab(t("システム", "System"), id="system") as system_t:
                 system = system_tab(engine)
 
         # Lists shared across tabs are re-read when a tab is opened, since other users may have changed them.
@@ -65,12 +72,13 @@ def build_app(engine: Engine) -> gr.Blocks:
         custom_t.select(custom.show_samples, custom.speaker, custom.sample_outputs, queue=False)
         system.samples_done.then(custom.show_samples, custom.speaker, custom.sample_outputs, queue=False)
         demo.load(custom.show_samples, custom.speaker, custom.sample_outputs, queue=False)
+        demo.load(clone.enable_recording, None, [clone.ref_audio, clone.mic_note], queue=False)
 
         # Library -> clone tab with the voice filled in (F-54).
-        def use_voice(speaker_id):
+        def use_voice(speaker_id, request: gr.Request):
             spk = engine.speakers.get(speaker_id) if speaker_id is not None else None
             if spk is None:
-                raise gr.Error("話者を選んでください。")
+                raise gr.Error(say(M.PICK_SPEAKER, request))
             return (gr.Tabs(selected="clone"), gr.Dropdown(choices=voice_choices(engine.speakers), value=spk["id"]),
                     spk["ref_audio"], spk["ref_text"] or "", spk["x_vector_only"])
 
@@ -81,24 +89,41 @@ def build_app(engine: Engine) -> gr.Blocks:
         restore_outputs = {tabs, clone.voice, clone.ref_audio, clone.ref_text, clone.x_vector_only, design.instruct,
                            custom.speaker, custom.instruct, *clone.controls.inputs(), *design.controls.inputs(),
                            *custom.controls.inputs()}
-        history.open_button.click(lambda record_id: restore(engine, record_id, tabs, clone, design, custom),
+        def open_record(record_id, request: gr.Request):
+            return restore(engine, record_id, request, tabs, clone, design, custom)
+
+        # History -> compare slots (F-74).
+        def show_in_compare(record_ids):
+            records = [engine.history.get(i) for i in record_ids]
+            records = [r for r in records if r is not None][: len(compare.audios)]
+            values = []
+            for i in range(len(compare.audios)):
+                r = records[i] if i < len(records) else None
+                values += [r["audio_path"] if r else None, record_summary(r) if r else ""]
+            return [gr.Tabs(selected="compare"), *values]
+
+        history.compare_button.click(show_in_compare, history.compare_ids,
+                                     [tabs, *[x for pair in zip(compare.audios, compare.results) for x in pair]],
+                                     queue=False)
+
+        history.open_button.click(open_record,
                                   history.selected, restore_outputs, queue=False)
     demo.queue(max_size=settings.queue_size, default_concurrency_limit=8)
     return demo
 
 
-def restore(engine: Engine, record_id: str, tabs: gr.Tabs, clone: CloneTab, design: DesignTab,
-            custom: CustomTab) -> dict:
+def restore(engine: Engine, record_id: str, request: gr.Request | None, tabs: gr.Tabs, clone: CloneTab,
+            design: DesignTab, custom: CustomTab) -> dict:
     rec = engine.history.get(record_id) if record_id else None
     if rec is None:
-        raise gr.Error("履歴が見つかりません。")
+        raise gr.Error(say(M.NO_HISTORY, request))
     p = rec["params"]
     tab = {"base": clone, "voice_design": design, "custom_voice": custom}[rec["kind"]]
     values = tab.controls.restore(p)
     if rec["kind"] == "base":
         ref = p["ref_audio"] if p["ref_audio"] and Path(p["ref_audio"]).exists() else None
         if ref is None:
-            gr.Warning("参照音声のファイルが見つかりません。参照音声を指定し直してください。")
+            gr.Warning(say(M.REF_MISSING, request))
         voice = engine.speakers.find_by_ref(p["ref_audio"], p["ref_text"], p["x_vector_only"]) if ref else None
         values.update({clone.voice: gr.Dropdown(choices=voice_choices(engine.speakers),
                                                 value=voice["id"] if voice else None),
@@ -139,13 +164,14 @@ def main():
     settings = Settings(data_dir=args.data_dir, vram_budget_gib=args.vram_budget, max_chars=args.max_chars,
                         queue_size=args.queue_size, target_lufs=args.target_lufs,
                         preload=parse_preload(args.preload))
-    models = ModelManager(settings.vram_budget_gib)
+    models = ModelManager(settings.vram_budget_gib, model_ids=PLAYGROUND_MODEL_IDS, loaders={ASR_KEY[0]: load_asr})
     engine = Engine(settings, models, HistoryStore(settings.db_path), SpeakerStore(settings.db_path, settings.refs_dir))
     for kind, size in settings.preload:
         models.get(kind, size, "sdpa")
 
-    build_app(engine).launch(server_name=args.host, server_port=args.port,
-                             allowed_paths=[str(settings.data_dir)])
+    demo = build_app(engine)  # registers the UI texts; i18n.build() must come after it
+    demo.launch(server_name=args.host, server_port=args.port, allowed_paths=[str(settings.data_dir)],
+                i18n=i18n.build())
 
 
 if __name__ == "__main__":

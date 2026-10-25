@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Callable
 
 from tts_core import SPEAKERS
 
+from playground import messages as M
 from playground.config import Settings
-from playground.engine import Engine, GenRequest
+from playground.engine import Engine, GenRequest, Progress
 
 SAMPLE_TEXTS = {
     "japanese": "こんにちは。私の声はこんな感じです。どうぞよろしくお願いします。",
@@ -28,12 +28,12 @@ def sample_path(settings: Settings, speaker: str, language: str) -> Path:
 
 
 def generate_samples(engine: Engine, force: bool = False,
-                     progress: Callable[[str], None] = print) -> int:
+                     progress: Progress = lambda m, detail="", fraction=None: print(m.en + detail)) -> int:
     """Generate missing samples with CustomVoice 1.7B (not recorded in history). Returns how many were made."""
     todo = [(s, lang) for s in SPEAKERS for lang in SAMPLE_TEXTS
             if force or not sample_path(engine.settings, s, lang).exists()]
     for i, (speaker, lang) in enumerate(todo, 1):
-        progress(f"話者サンプルを生成中 {i}/{len(todo)}: {speaker} ({lang})")
+        progress(M.MAKING_SAMPLES, f" {i} / {len(todo)} ({speaker}, {lang})", (i - 1) / len(todo))
         req = GenRequest(kind="custom_voice", speaker=speaker, language=lang, text=SAMPLE_TEXTS[lang],
                          seed=SAMPLE_SEED)
         engine.generate(req, record=False, out_path=sample_path(engine.settings, speaker, lang))

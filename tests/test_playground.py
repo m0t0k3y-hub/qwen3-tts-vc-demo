@@ -231,3 +231,118 @@ def test_prompt_path_depends_on_size_and_reference(engine):
     assert engine._prompt_path(a) == engine._prompt_path(b)
     assert engine._prompt_path(a) != engine._prompt_path(GenRequest(**{**a.__dict__, "size": "0.6B"}))
     assert engine._prompt_path(a) != engine._prompt_path(GenRequest(**{**a.__dict__, "ref_text": "u"}))
+
+
+# ---- reference pre-processing ---------------------------------------------------------------
+
+def test_prepare_reference_trims_and_normalizes(tmp_path):
+    from playground.audio import prepare_reference
+    import soundfile as sf
+    silence = np.zeros(SR, dtype=np.float32)
+    src = tmp_path / "ref.wav"
+    sf.write(src, np.concatenate([silence, _tone(2.0, 0.05), silence]), SR)
+
+    as_is, sec = prepare_reference(src, tmp_path / "refs")
+    assert sec == pytest.approx(4.0, abs=0.01)
+    trimmed, sec = prepare_reference(src, tmp_path / "refs", trim=True, normalize=True, target_lufs=-20)
+    assert sec == pytest.approx(2.2, abs=0.15)  # 2 s of tone + 0.1 s margin each side (frame-level precision)
+    wav, _ = sf.read(trimmed)
+    assert pyln.Meter(SR).integrated_loudness(wav) == pytest.approx(-20, abs=1.0)
+    again, _ = prepare_reference(src, tmp_path / "refs", trim=True, normalize=True, target_lufs=-20)
+    assert again == trimmed  # content-addressed
+
+
+def test_split_sentences_and_batch_lines():
+    from playground.text import batch_lines, split_sentences
+    assert split_sentences("一つ目。二つ目！\n三つ目 3.5 です? Last one. ok") == \
+        ["一つ目。", "二つ目！", "三つ目 3.5 です?", "Last one.", "ok"]
+    assert batch_lines(" a \n\n b\n") == ["a", "b"]
+
+
+def test_messages_have_unique_keys():
+    from playground.messages import MESSAGES
+    assert len({m.ja for m in MESSAGES}) == len(MESSAGES)
+
+
+# ---- engine with a fake model ---------------------------------------------------------------
+
+class FakeTTS:
+    """Returns 0.1 s of audio per character; records the texts it was called with."""
+
+    device = "cpu"
+
+    def __init__(self, on_call=None):
+        self.calls = []
+        self.on_call = on_call
+
+    def generate_custom_voice(self, text, language, speaker, instruct, non_streaming_mode, **gen):
+        self.calls.append(text)
+        if self.on_call:
+            self.on_call(len(self.calls))
+        texts = text if isinstance(text, list) else [text]
+        return [np.full(int(SR * 0.1 * len(t)), 0.1, dtype=np.float32) for t in texts], SR
+
+
+needs_cuda = pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="timing uses torch.cuda")
+
+
+@pytest.fixture
+def fake_engine(tmp_path):
+    fake = FakeTTS()
+    settings = Settings(data_dir=tmp_path, metrics_path=tmp_path / "metrics.jsonl")
+    models = ModelManager(18, loader=lambda model_id, attn: (fake, {"load_sec": 0.0}), allocated_gib=lambda: 0.0)
+    return Engine(settings, models, HistoryStore(settings.db_path)), fake
+
+
+@needs_cuda
+def test_split_generates_per_sentence_and_joins(fake_engine):
+    import soundfile as sf
+    engine, fake = fake_engine
+    r = engine.generate(GenRequest(kind="custom_voice", speaker="ryan", text="あ。いい。ううう。", split=True,
+                                   pause_sec=0.5, normalize=False))
+    assert fake.calls[1:] == ["あ。", "いい。", "ううう。"]  # calls[0] is the warm-up
+    assert r.audio_sec == pytest.approx((2 + 3 + 4) * 0.1 + 2 * 0.5)
+    assert len(sf.read(r.audio_path)[0]) == int(round(r.audio_sec * SR))
+    assert [h["text"] for h in engine.history.search()] == ["あ。いい。ううう。"]
+
+
+@needs_cuda
+def test_batch_makes_one_record_per_line(fake_engine):
+    engine, fake = fake_engine
+    results = engine.generate_batch(GenRequest(kind="custom_voice", speaker="ryan", text="ab\n\ncdef\n", batch=True))
+    assert fake.calls[-1] == ["ab", "cdef"]
+    assert [r.text for r in results] == ["ab", "cdef"]
+    assert [r.audio_sec for r in results] == pytest.approx([0.2, 0.4])
+    records = engine.history.search()
+    assert {r["params"]["batch_id"] for r in records} == {results[0].id} and len(records) == 2
+
+
+@needs_cuda
+def test_cancel_stops_before_next_sentence(fake_engine):
+    from playground.messages import Cancelled
+    engine, fake = fake_engine
+    fake.on_call = lambda n: engine.cancel("session") if n == 2 else None  # during the first sentence
+    with pytest.raises(Cancelled):
+        engine.generate(GenRequest(kind="custom_voice", speaker="ryan", text="一。二。三。", split=True),
+                        cancel_token="session")
+    assert len(fake.calls) == 2 and engine.history.search() == []
+    engine.generate(GenRequest(kind="custom_voice", speaker="ryan", text="一。二。", split=True),
+                    cancel_token="session")  # the flag does not leak into the next run
+
+
+def test_validate_long_text_modes(engine):
+    with pytest.raises(ValueError, match="同時"):
+        engine.validate(GenRequest(kind="custom_voice", speaker="ryan", text="a", split=True, batch=True))
+    engine.settings.max_chars = 100
+    with pytest.raises(ValueError, match="行数"):
+        engine.validate(GenRequest(kind="custom_voice", speaker="ryan", text="\n".join("a" * 9), batch=True))
+
+
+def test_parse_seed():
+    from playground.ui_common import parse_seed
+    assert parse_seed("") is None and parse_seed(None) is None and parse_seed("  ") is None
+    assert parse_seed(" 42 ") == 42 and parse_seed(0) is None  # 0 from an old gr.Number would be ambiguous
+    with pytest.raises(ValueError, match="seed"):
+        parse_seed("-1")
+    with pytest.raises(ValueError, match="seed"):
+        parse_seed("abc")

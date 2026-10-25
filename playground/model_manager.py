@@ -24,6 +24,7 @@ INITIAL_ESTIMATE_GIB = {
     ("voice_design", "1.7B"): 4.5,
     ("custom_voice", "1.7B"): 4.4,
     ("custom_voice", "0.6B"): 2.6,
+    ("asr", "large-v3"): 3.4,  # Whisper large-v3 fp16, measured in phase 3
 }
 # Activations and KV cache on top of the weights during generation (spike: ~0.5-1.0 GiB).
 GEN_MARGIN_GIB = 1.0
@@ -41,13 +42,19 @@ class LoadedModel:
 
 class ModelManager:
     """Keeps loaded models keyed by (kind, size, attn) and evicts the least recently used one
-    when loading another would exceed `budget_gib` (sum of per-model estimates)."""
+    when loading another would exceed `budget_gib` (sum of per-model estimates).
+
+    `model_ids` maps (kind, size) to a model id; `loaders` overrides the loader per kind (e.g. Whisper)."""
 
     def __init__(self, budget_gib: float,
                  loader: Callable[[str, str], tuple[Any, dict]] = load_model,
-                 allocated_gib: Callable[[], float] = lambda: torch.cuda.memory_allocated() / GiB):
+                 allocated_gib: Callable[[], float] = lambda: torch.cuda.memory_allocated() / GiB,
+                 model_ids: dict[tuple[str, str], str] = MODEL_IDS,
+                 loaders: dict[str, Callable[[str, str], tuple[Any, dict]]] | None = None):
         self.budget_gib = budget_gib
+        self.model_ids = model_ids
         self._loader = loader
+        self._loaders = loaders or {}
         self._allocated_gib = allocated_gib
         self._models: OrderedDict[ModelKey, LoadedModel] = OrderedDict()  # least recently used first
         self._estimates: dict[tuple[str, str], float] = dict(INITIAL_ESTIMATE_GIB)
@@ -59,7 +66,7 @@ class ModelManager:
     def get(self, kind: str, size: str, attn: str,
             on_load: Callable[[str], None] | None = None) -> tuple[LoadedModel, bool]:
         """Return the model, loading it if needed. The bool is True if a load happened in this call."""
-        if (kind, size) not in MODEL_IDS:
+        if (kind, size) not in self.model_ids:
             raise ValueError(f"unknown model: {kind} {size}")
         key = (kind, size, attn)
         with self._lock:
@@ -70,10 +77,11 @@ class ModelManager:
                 return entry, False
 
             self._make_room(self.estimate_gib(kind, size))
+            model_id = self.model_ids[(kind, size)]
             if on_load:
-                on_load(MODEL_IDS[(kind, size)])
+                on_load(model_id)
             before = self._allocated_gib()
-            model, info = self._loader(MODEL_IDS[(kind, size)], attn)
+            model, info = self._loaders.get(kind, self._loader)(model_id, attn)
             weights = max(self._allocated_gib() - before, 0.0)
             if weights > 0:
                 self._estimates[(kind, size)] = weights + GEN_MARGIN_GIB
@@ -93,7 +101,7 @@ class ModelManager:
             entry = self._models.pop(key, None)
             if entry is None:
                 return False
-            print(f"[unload] {MODEL_IDS[key[:2]]} attn={key[2]}")
+            print(f"[unload] {self.model_ids[key[:2]]} attn={key[2]}")
             del entry
             _free_cuda()
             return True

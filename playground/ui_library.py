@@ -8,10 +8,14 @@ from typing import Callable
 import gradio as gr
 
 from .engine import Engine
+from . import messages as M
+from .i18n import say, t
+from .messages import UserError
 from .speakers import SOURCES
-from .ui_common import clip
+from .ui_common import clip, user_error
 
-HEADERS = ["名前", "作成元", "メモ", "書き起こし", "作成日時"]
+HEADERS = ["名前 / Name", "作成元 / Source", "メモ / Memo", "書き起こし / Transcript", "作成日時 / Created"]
+XVEC_ONLY = "（x-vector only）"
 
 
 @dataclass
@@ -24,30 +28,32 @@ class LibraryTab:
 
 def library_tab(engine: Engine) -> LibraryTab:
     store = engine.speakers
-    gr.Markdown("クローンした声と VoiceDesign で作った声を、全員で共有して使い回せます。"
-                "声はボイスクローンタブやVoiceDesign タブの生成結果の下から保存できます。")
+    gr.Markdown(t("クローンした声と VoiceDesign で作った声を、全員で共有して使い回せます。"
+                  "声はボイスクローンタブや VoiceDesign タブの生成結果の下から保存できます。",
+                  "Voices cloned or made with VoiceDesign, shared by everyone. Save a voice from under a result "
+                  "in the voice clone or VoiceDesign tab."))
     ids = gr.State([])
     table = gr.Dataframe(headers=HEADERS, interactive=False, wrap=True, max_height=360)
     selected = gr.State(None)
     with gr.Row():
         with gr.Column():
-            audio = gr.Audio(label="参照音声", type="filepath", interactive=False)
-            ref_text = gr.Textbox(label="書き起こし", interactive=False, lines=2)
-            design = gr.JSON(label="VoiceDesign の条件", visible=False)
+            audio = gr.Audio(label=t("参照音声", "Reference audio"), type="filepath", interactive=False)
+            ref_text = gr.Textbox(label=t("書き起こし", "Transcript"), interactive=False, lines=2)
+            design = gr.JSON(label=t("VoiceDesign の条件", "VoiceDesign conditions"), visible=False)
         with gr.Column():
-            name = gr.Textbox(label="名前")
-            memo = gr.Textbox(label="メモ", lines=2)
+            name = gr.Textbox(label=t("名前", "Name"))
+            memo = gr.Textbox(label=t("メモ", "Memo"), lines=2)
             with gr.Row():
-                save = gr.Button("名前・メモを更新", interactive=False)
-                delete = gr.Button("削除", variant="stop", interactive=False)
-            use = gr.Button("この声で読み上げる", variant="primary", interactive=False)
+                save = gr.Button(t("名前・メモを更新", "Update name / memo"), interactive=False)
+                delete = gr.Button(t("削除", "Delete"), variant="stop", interactive=False)
+            use = gr.Button(t("この声で読み上げる", "Read with this voice"), variant="primary", interactive=False)
 
     detail = [selected, audio, ref_text, design, name, memo, save, delete, use]
 
     def rows():
         speakers = store.list()
         data = [[s["name"], SOURCES[s["source"]], clip(s["memo"], 40),
-                 "（x-vector only）" if s["x_vector_only"] else clip(s["ref_text"] or "", 40),
+                 XVEC_ONLY if s["x_vector_only"] else clip(s["ref_text"] or "", 40),
                  s["created_at"].replace("T", " ")] for s in speakers]
         return data, [s["id"] for s in speakers]
 
@@ -56,23 +62,23 @@ def library_tab(engine: Engine) -> LibraryTab:
             off = gr.Button(interactive=False)
             return None, None, "", gr.JSON(visible=False), "", "", off, off, off
         on = gr.Button(interactive=True)
-        return (spk["id"], spk["ref_audio"], spk["ref_text"] or "（x-vector only）",
+        return (spk["id"], spk["ref_audio"], spk["ref_text"] or XVEC_ONLY,
                 gr.JSON(spk["design"], visible=spk["design"] is not None), spk["name"], spk["memo"], on, on, on)
 
     def select(ids, evt: gr.SelectData):
         return show(store.get(ids[evt.index[0]]))
 
-    def update(speaker_id, name, memo):
+    def update(speaker_id, name, memo, request: gr.Request):
         try:
             spk = store.update(speaker_id, name, memo)
-        except ValueError as e:
-            raise gr.Error(str(e)) from e
-        gr.Info("更新しました。")
+        except UserError as e:
+            raise user_error(e, request) from e
+        gr.Info(say(M.UPDATED, request))
         return *rows(), *show(spk)
 
-    def remove(speaker_id):
+    def remove(speaker_id, request: gr.Request):
         store.delete(speaker_id)
-        gr.Info("削除しました。")
+        gr.Info(say(M.DELETED, request))
         return *rows(), *show(None)
 
     table.select(select, ids, detail, queue=False)

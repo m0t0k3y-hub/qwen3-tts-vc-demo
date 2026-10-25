@@ -8,9 +8,11 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from . import messages as M
 from .audio import store_by_hash
+from .messages import UserError
 
-SOURCES = {"clone": "クローン", "voice_design": "VoiceDesign"}
+SOURCES = {"clone": "クローン (Clone)", "voice_design": "VoiceDesign"}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS speakers (
@@ -44,13 +46,13 @@ class SpeakerStore:
         """`design` holds the VoiceDesign description and generation conditions for source='voice_design'."""
         name = name.strip()
         if not name:
-            raise ValueError("話者の名前を入力してください。")
+            raise UserError(M.NAME_EMPTY)
         if source not in SOURCES:
             raise ValueError(f"unknown source: {source}")
         if not x_vector_only and not (ref_text or "").strip():
-            raise ValueError("書き起こしがない声は、x-vector only モードでのみ保存できます。")
+            raise UserError(M.NEEDS_TRANSCRIPT)
         if self.get_by_name(name):
-            raise ValueError(f"「{name}」という話者は既にあります。別の名前にしてください。")
+            raise UserError(M.NAME_TAKEN, f" {name}")
         path, _ = store_by_hash(ref_audio, self.refs_dir)
         with self._lock, self._conn:
             cur = self._conn.execute(
@@ -81,10 +83,10 @@ class SpeakerStore:
     def update(self, speaker_id: int, name: str, memo: str) -> dict:
         name = name.strip()
         if not name:
-            raise ValueError("話者の名前を入力してください。")
+            raise UserError(M.NAME_EMPTY)
         other = self.get_by_name(name)
         if other and other["id"] != speaker_id:
-            raise ValueError(f"「{name}」という話者は既にあります。別の名前にしてください。")
+            raise UserError(M.NAME_TAKEN, f" {name}")
         with self._lock, self._conn:
             self._conn.execute("UPDATE speakers SET name = ?, memo = ? WHERE id = ?", (name, memo.strip(), speaker_id))
         return self.get(speaker_id)

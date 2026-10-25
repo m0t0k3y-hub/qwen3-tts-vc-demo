@@ -9,32 +9,43 @@ import gradio as gr
 from tts_core import GEN_DEFAULTS
 
 from .engine import Engine, GenRequest
-from .ui_common import (GPU, KIND_LABELS, LANGUAGE_CHOICES, SPEAKER_CHOICES, example_text_picker, format_result,
-                        speaker_label, voice_choices)
+from .i18n import t, tm
+from .messages import UserError, msg
+from .ui_common import (GPU, KIND_LABELS, LANGUAGE_CHOICES, SPEAKER_CHOICES, cancel_fn, client_ip,
+                        example_text_picker, format_result, parse_seed, progress_fn, seed_box, speaker_label,
+                        voice_choices)
 
 N_COLUMNS = 4
 # The generation parameters offered per column; the others stay at their defaults.
 COMPARE_PARAMS = ["temperature", "top_k", "top_p", "repetition_penalty", "subtalker_temperature"]
 FIELDS = ["kind", "size", "voice", "speaker", "instruct", "seed", "normalize", *COMPARE_PARAMS]
+PICK_VOICE = msg("クローンの話者を話者ライブラリから選んでください。", "Pick a voice from the speaker library for cloning.")
+DIFF = t("条件 1 との違い:", "Differences from condition 1:")
+NO_DIFF = t("条件 1 との違い: なし", "Differences from condition 1: none")
+CONDITION_LABELS = [t(f"条件 {i + 1}", f"Condition {i + 1}") for i in range(N_COLUMNS)]
+RESULT_LABELS = [t(f"結果 {i + 1}", f"Result {i + 1}") for i in range(N_COLUMNS)]
 
 
 @dataclass
 class CompareTab:
     voices: list[gr.Dropdown]  # speaker library pickers, refreshed when the tab opens
+    audios: list[gr.Audio]  # result slots, also filled from the history (F-74)
+    results: list[gr.Markdown]
 
 
 def _column(i: int, engine: Engine) -> tuple[gr.Checkbox | None, dict, gr.Audio, gr.Markdown, gr.Button | None]:
-    gr.Markdown(f"### 条件 {i + 1}")
-    enabled = None if i == 0 else gr.Checkbox(False, label="この条件を使う")
-    copy = None if i == 0 else gr.Button("条件 1 を複製", size="sm")
+    gr.Markdown("### " + CONDITION_LABELS[i])
+    enabled = None if i == 0 else gr.Checkbox(False, label=t("この条件を使う", "Use this condition"))
+    copy = None if i == 0 else gr.Button(t("条件 1 を複製", "Copy condition 1"), size="sm")
     c = {
-        "kind": gr.Dropdown([(v, k) for k, v in KIND_LABELS.items()], value="custom_voice", label="モデル"),
-        "size": gr.Radio(["1.7B", "0.6B"], value="1.7B", label="サイズ"),
-        "voice": gr.Dropdown(voice_choices(engine.speakers), value=None, label="話者（ライブラリ）", visible=False),
-        "speaker": gr.Dropdown(SPEAKER_CHOICES, value="ono_anna", label="話者"),
-        "instruct": gr.Textbox(label="説明 / スタイル指示", lines=2),
-        "seed": gr.Number(0, label="seed", precision=0, minimum=0, info="空欄ならランダム"),
-        "normalize": gr.Checkbox(True, label="音量を正規化"),
+        "kind": gr.Dropdown([(v, k) for k, v in KIND_LABELS.items()], value="custom_voice", label=t("モデル", "Model")),
+        "size": gr.Radio(["1.7B", "0.6B"], value="1.7B", label=t("サイズ", "Size")),
+        "voice": gr.Dropdown(voice_choices(engine.speakers), value=None,
+                             label=t("話者（ライブラリ）", "Voice (library)"), visible=False),
+        "speaker": gr.Dropdown(SPEAKER_CHOICES, value="ono_anna", label=t("話者", "Speaker")),
+        "instruct": gr.Textbox(label=t("説明 / スタイル指示", "Description / style instruction"), lines=2),
+        "seed": seed_box("0"),
+        "normalize": gr.Checkbox(True, label=t("音量を正規化", "Normalize loudness")),
         "temperature": gr.Slider(0.05, 2.0, GEN_DEFAULTS["temperature"], step=0.05, label="temperature"),
         "top_k": gr.Slider(0, 200, GEN_DEFAULTS["top_k"], step=1, label="top_k"),
         "top_p": gr.Slider(0.05, 1.0, GEN_DEFAULTS["top_p"], step=0.01, label="top_p"),
@@ -43,7 +54,7 @@ def _column(i: int, engine: Engine) -> tuple[gr.Checkbox | None, dict, gr.Audio,
         "subtalker_temperature": gr.Slider(0.05, 2.0, GEN_DEFAULTS["subtalker_temperature"], step=0.05,
                                            label="subtalker_temperature"),
     }
-    audio = gr.Audio(label=f"結果 {i + 1}", type="filepath", interactive=False, buttons=["download"])
+    audio = gr.Audio(label=RESULT_LABELS[i], type="filepath", interactive=False, buttons=["download"])
     md = gr.Markdown()
 
     def on_kind(kind):
@@ -56,16 +67,20 @@ def _column(i: int, engine: Engine) -> tuple[gr.Checkbox | None, dict, gr.Audio,
 
 
 def compare_tab(engine: Engine) -> CompareTab:
-    gr.Markdown("同じテキストを、条件を変えて最大 4 件生成し、聴き比べます。"
-                "生成パラメータは主なものだけを変えられます（他は既定値）。条件 2〜4 の結果には、条件 1 との違いを表示します。")
-    text = gr.Textbox(label="合成するテキスト", lines=3, info=f"上限 {engine.settings.max_chars} 文字")
+    gr.Markdown(t("同じテキストを、条件を変えて最大 4 件生成し、聴き比べます。"
+                  "生成パラメータは主なものだけを変えられます（他は既定値）。条件 2〜4 の結果には、条件 1 との違いを表示します。",
+                  "Generate the same text under up to 4 conditions and compare them. Only the main generation "
+                  "parameters can be changed (the rest use defaults). Results 2-4 show how they differ from condition 1."))
+    max_chars = engine.settings.max_chars
+    text = gr.Textbox(label=t("合成するテキスト", "Text to synthesize"), lines=3,
+                      info=t(f"上限 {max_chars} 文字", f"Up to {max_chars} characters"))
     with gr.Row():
-        language = gr.Dropdown(LANGUAGE_CHOICES, value="auto", label="言語")
+        language = gr.Dropdown(LANGUAGE_CHOICES, value="auto", label=t("言語", "Language"))
         example_text_picker(text, language)
     with gr.Row():
-        run = gr.Button("生成", variant="primary", scale=3)
-        sweep = gr.Button("seed だけ変えて 4 件", scale=1)
-        cancel = gr.Button("キャンセル", scale=1)
+        run = gr.Button(t("生成", "Generate"), variant="primary", scale=3)
+        sweep = gr.Button(t("seed だけ変えて 4 件", "4 runs, different seeds only"), scale=1)
+        cancel = gr.Button(t("キャンセル", "Cancel"), scale=1)
 
     cols, enabled, audios, mds = [], [], [], []
     with gr.Row(equal_height=False):
@@ -82,10 +97,13 @@ def compare_tab(engine: Engine) -> CompareTab:
 
     def do_sweep(*vals):
         base = dict(zip(FIELDS, vals))
-        seed = int(base["seed"] or 0)
-        out = [seed]
+        try:
+            seed = parse_seed(base["seed"]) or 0
+        except UserError:
+            seed = 0
+        out = [str(seed)]
         for i in range(1, N_COLUMNS):
-            out += [*(seed + i if f == "seed" else base[f] for f in FIELDS), True]
+            out += [*(str(seed + i) if f == "seed" else base[f] for f in FIELDS), True]
         return out
 
     sweep.click(do_sweep, [cols[0][f] for f in FIELDS],
@@ -93,27 +111,28 @@ def compare_tab(engine: Engine) -> CompareTab:
                 queue=False)
 
     def describe(v: dict) -> dict[str, str]:
-        d = {"モデル": KIND_LABELS[v["kind"]], "サイズ": v["size"]}
+        # Shown after a single translated prefix, so the field names stay as neutral parameter-style names.
+        d = {"model": KIND_LABELS[v["kind"]], "size": v["size"]}
         if v["kind"] == "base":
             spk = engine.speakers.get(v["voice"]) if v["voice"] is not None else None
-            d["話者"] = spk["name"] if spk else "（未選択）"
+            d["voice"] = spk["name"] if spk else "—"
         if v["kind"] == "custom_voice":
-            d["話者"] = speaker_label(v["speaker"])
+            d["voice"] = speaker_label(v["speaker"])
         if v["kind"] != "base":
-            d["指示"] = v["instruct"] or "（なし）"
-        d["seed"] = "ランダム" if v["seed"] is None else str(int(v["seed"]))
-        d["正規化"] = "あり" if v["normalize"] else "なし"
+            d["instruct"] = v["instruct"] or "—"
+        d["seed"] = (v["seed"] or "").strip() or "random"
+        d["normalize"] = "on" if v["normalize"] else "off"
         d.update({k: f"{v[k]:g}" for k in COMPARE_PARAMS})
         return d
 
     def build_request(v: dict, text: str, language: str) -> GenRequest:
         req = GenRequest(kind=v["kind"], text=text, size=v["size"], language=language,
-                         seed=None if v["seed"] is None else int(v["seed"]), normalize=v["normalize"],
+                         seed=parse_seed(v["seed"]), normalize=v["normalize"],
                          gen={k: v[k] for k in COMPARE_PARAMS})
         if v["kind"] == "base":
             spk = engine.speakers.get(v["voice"]) if v["voice"] is not None else None
             if spk is None:
-                raise ValueError("クローンの話者を話者ライブラリから選んでください。")
+                raise UserError(PICK_VOICE)
             req.ref_audio, req.ref_text, req.x_vector_only = spk["ref_audio"], spk["ref_text"], spk["x_vector_only"]
         elif v["kind"] == "custom_voice":
             req.speaker, req.instruct = v["speaker"], v["instruct"]
@@ -128,15 +147,16 @@ def compare_tab(engine: Engine) -> CompareTab:
             vals = {f: data[cols[i][f]] for f in FIELDS}
             try:
                 req = build_request(vals, data[text], data[language])
-                result = engine.generate(req, client_ip=request.client.host if request and request.client else None,
-                                         progress=lambda msg: progress(None, desc=f"条件 {i + 1}: {msg}"))
-            except ValueError as e:
-                return None, f"⚠️ {e}"
+                result = engine.generate(req, client_ip=client_ip(request),
+                                         progress=progress_fn(progress, request, prefix=f"#{i + 1} "),
+                                         cancel_token=request.session_hash)
+            except UserError as e:
+                return None, "⚠️ " + tm(e.msg, e.detail)
             md = format_result(result)
             if i > 0:
                 ref = describe({f: data[cols[0][f]] for f in FIELDS})
                 diff = [f"**{k}**: {ref.get(k, '—')} → {v}" for k, v in describe(vals).items() if ref.get(k) != v]
-                md += "\n\n条件 1 との違い: " + ("、".join(diff) if diff else "なし")
+                md += "\n\n" + (str(DIFF) + " " + ", ".join(diff) if diff else str(NO_DIFF))
             return str(result.audio_path), md
 
         return handler
@@ -149,5 +169,5 @@ def compare_tab(engine: Engine) -> CompareTab:
     for i in range(N_COLUMNS):
         event = event.then(make_handler(i), inputs[i], [audios[i], mds[i]], **GPU)
         events.append(event)
-    cancel.click(None, cancels=events)
-    return CompareTab([c["voice"] for c in cols])
+    cancel.click(cancel_fn(engine), None, None, cancels=events, queue=False)
+    return CompareTab([c["voice"] for c in cols], audios, mds)
