@@ -5,3 +5,4 @@ outputs/
 samples/
 wheels/
 *:Zone.Identifier
+playground_data/

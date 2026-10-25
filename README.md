@@ -106,6 +106,59 @@ samples/en.wav   英語の参照音声（5〜10 秒）
 samples/en.txt   その書き起こし
 ```
 
+## プレイグラウンド（Web UI）
+
+3種類のモデルをブラウザから試せる Gradio アプリです。要件は [docs/playground.md](docs/playground.md) にまとめています（現在はフェーズ1まで実装済み）。
+
+```bash
+uv run playground/app.py          # http://localhost:7860
+```
+
+- 生成は GPU 1枚で1件ずつ順に処理します。複数人が同時に使うと、後から投げた生成は待ち行列に入ります。
+- モデルは使うときにロードし、VRAM の上限（既定 18 GiB）を超えそうになったら、最も長く使われていないモデルから解放します。
+- 生成結果と条件は `playground_data/` に保存され、「履歴」タブで全員の結果を検索・再生・削除できます。計測値は `outputs/metrics.jsonl` にも追記されます。
+
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--host` / `--port` | `0.0.0.0` / `7860` | 待ち受けアドレスとポート |
+| `--preload` | `base:1.7B` | 起動時にロードするモデル（例: `base:1.7B custom_voice:0.6B`。`none` でロードしない） |
+| `--vram-budget` | `18` | モデルを常駐させる VRAM の上限（GiB） |
+| `--max-chars` | `500` | 1回に合成できる文字数の上限 |
+| `--queue-size` | `20` | 待ち行列の上限 |
+| `--target-lufs` | `-16` | 音量正規化の目標ラウドネス |
+| `--data-dir` | `playground_data` | 履歴と音声の保存先 |
+
+### 社内 LAN に公開する（WSL2）
+
+WSL2 の中で起動したアプリに、LAN 上の他の PC からアクセスするには、次のどちらかを行います。
+
+**方法1: mirrored ネットワーク（Windows 11 22H2 以降）**
+
+Windows 側の `%UserProfile%\.wslconfig` に次を書き、PowerShell で `wsl --shutdown` してから WSL を起動し直します。
+
+```ini
+[wsl2]
+networkingMode=mirrored
+```
+
+続けて、管理者の PowerShell で Hyper-V ファイアウォールと Windows ファイアウォールの受信を許可します。
+
+```powershell
+Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -DefaultInboundAction Allow
+New-NetFirewallRule -DisplayName "Qwen3-TTS Playground" -Direction Inbound -Protocol TCP -LocalPort 7860 -Action Allow
+```
+
+**方法2: ポートフォワード**
+
+WSL の IP アドレス（WSL 内で `hostname -I`）に、Windows のポートを転送します。WSL の IP は再起動で変わるため、そのたびに設定し直してください。管理者の PowerShell で実行します。
+
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=7860 connectaddress=<WSL の IP> connectport=7860
+New-NetFirewallRule -DisplayName "Qwen3-TTS Playground" -Direction Inbound -Protocol TCP -LocalPort 7860 -Action Allow
+```
+
+他の PC からは `http://<Windows の IP アドレス>:7860` で開きます。
+
 ## 注意
 
 - ボイスクローンは、本人の同意を得た声だけに使ってください。
